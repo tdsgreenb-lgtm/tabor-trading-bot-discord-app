@@ -1,0 +1,152 @@
+// TaborTrades Node.js Discord Bot (Slash Commands, SQLite)
+// Ready for hosting on Replit, Railway, Render, or local Node.js
+
+/* ---------- SETUP ---------- */
+// 1. Install Node.js if local, or use browser/cloud host
+// 2. Install dependencies: npm install discord.js better-sqlite3 dotenv
+// 3. Create .env file with your Discord token and IDs
+// 4. Run deploy-commands.js once to register slash commands
+// 5. Run index.js to start the bot
+
+/* ---------- .env Example ----------
+DISCORD_TOKEN=YOUR_BOT_TOKEN
+CLIENT_ID=YOUR_CLIENT_ID
+GUILD_ID=YOUR_TEST_GUILD_ID
+DATABASE_PATH=./data/tabortrades.sqlite
+ADMIN_ROLE_ID=
+COOLDOWN_SECONDS=10
+----------------------------------- */
+
+/* ---------- index.js ---------- */
+require('dotenv').config();
+const { Client, GatewayIntentBits, Collection, Events } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
+
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const COOLDOWN = Number(process.env.COOLDOWN_SECONDS || 10);
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+client.commands = new Collection();
+client.cooldowns = new Collection();
+
+// Load command files
+const commandFiles = fs.readdirSync(path.join(__dirname, 'commands')).filter(f => f.endsWith('.js'));
+for (const file of commandFiles) {
+    const command = require(`./commands/${file}`);
+    client.commands.set(command.data.name, command);
+}
+
+client.once(Events.ClientReady, () => {
+    console.log(`Logged in as ${client.user.tag}`);
+});
+
+client.on(Events.InteractionCreate, async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+
+    const command = client.commands.get(interaction.commandName);
+    if (!command) return;
+
+    // Cooldown handling
+    const now = Date.now();
+    const timestamps = client.cooldowns.get(command.data.name) || new Collection();
+    client.cooldowns.set(command.data.name, timestamps);
+    const userId = interaction.user.id;
+
+    if (!timestamps.has(userId)) {
+        timestamps.set(userId, now);
+        setTimeout(() => timestamps.delete(userId), COOLDOWN * 1000);
+    } else {
+        const expirationTime = timestamps.get(userId) + COOLDOWN * 1000;
+        if (now < expirationTime) {
+            const timeLeft = Math.ceil((expirationTime - now) / 1000);
+            return interaction.reply({ content: `Please wait ${timeLeft}s before using this command again.`, ephemeral: true });
+        }
+        timestamps.set(userId, now);
+    }
+
+    try {
+        await command.execute(interaction);
+    } catch (error) {
+        console.error(error);
+        if (interaction.replied || interaction.deferred) {
+            interaction.followUp({ content: 'There was an error executing this command!', ephemeral: true });
+        } else {
+            interaction.reply({ content: 'There was an error executing this command!', ephemeral: true });
+        }
+    }
+});
+
+client.login(DISCORD_TOKEN);
+
+/* ---------- db.js ---------- */
+const Database = require('better-sqlite3');
+const fs = require('fs');
+const path = require('path');
+const dbPath = process.env.DATABASE_PATH || path.join(__dirname, 'data', 'tabortrades.sqlite');
+if (!fs.existsSync(path.dirname(dbPath))) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+const db = new Database(dbPath);
+const initSql = `
+CREATE TABLE IF NOT EXISTS trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  item TEXT NOT NULL,
+  details TEXT,
+  price TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  trade_id INTEGER,
+  reporter_id TEXT,
+  reason TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS verified (
+  user_id TEXT PRIMARY KEY,
+  verified_at INTEGER NOT NULL
+);
+`;
+db.exec(initSql);
+module.exports = db;
+
+/* ---------- utils.js ---------- */
+const dbUtils = require('./db');
+module.exports = {
+    createTrade: (userId, username, item, details, price) => {
+        const stmt = dbUtils.prepare(`INSERT INTO trades (user_id, username, item, details, price, created_at) VALUES (?, ?, ?, ?, ?, ?)`);
+        return stmt.run(userId, username, item, details, price, Date.now()).lastInsertRowid;
+    },
+    getTrades: (limit = 25) => dbUtils.prepare(`SELECT * FROM trades ORDER BY created_at DESC LIMIT ?`).all(limit),
+    searchTrades: (term, limit = 25) => {
+        const t = `%${term}%`;
+        return dbUtils.prepare(`SELECT * FROM trades WHERE item LIKE ? OR details LIKE ? ORDER BY created_at DESC LIMIT ?`).all(t, t, limit);
+    },
+    getUserTrades: (userId) => dbUtils.prepare(`SELECT * FROM trades WHERE user_id = ? ORDER BY created_at DESC`).all(userId),
+    deleteTrade: (id, userId) => dbUtils.prepare(`DELETE FROM trades WHERE id = ? AND user_id = ?`).run(id, userId).changes > 0,
+    reportTrade: (tradeId, reporterId, reason) => dbUtils.prepare(`INSERT INTO reports (trade_id, reporter_id, reason, created_at) VALUES (?, ?, ?, ?)`).run(tradeId, reporterId, reason, Date.now()).lastInsertRowid,
+    verifyUser: (userId) => dbUtils.prepare(`INSERT OR REPLACE INTO verified (user_id, verified_at) VALUES (?, ?)`).run(userId, Date.now()),
+    isVerified: (userId) => !!dbUtils.prepare(`SELECT 1 FROM verified WHERE user_id = ?`).get(userId)
+};
+
+/* ---------- deploy-commands.js ---------- */
+require('dotenv').config();
+const { REST } = require('@discordjs/rest');
+const { Routes } = require('discord-api-types/v10');
+const fs = require('fs');
+const token = process.env.DISCORD_TOKEN;
+const clientId = process.env.CLIENT_ID;
+const guildId = process.env.GUILD_ID;
+const commands = [];
+const commandFiles = fs.readdirSync('./commands').filter(f => f.endsWith('.js'));
+for (const file of commandFiles) commands.push(require(`./commands/${file}`).data.toJSON());
+const rest = new REST({ version: '10' }).setToken(token);
+(async () => {
+    try {
+        console.log('Refreshing commands...');
+        if (guildId) await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
+        else await rest.put(Routes.applicationCommands(clientId), { body: commands });
+        console.log('Commands deployed!');
+    } catch (err) { console.error(err); }
+})();
